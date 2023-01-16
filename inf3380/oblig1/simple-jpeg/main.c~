@@ -1,0 +1,210 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <mpi.h>
+
+#define BLOCK_LOW(id, p, n) ((id)*(n)/(p))
+#define BLOCK_HIGH(id, p, n) (BLOCK_LOW(((id) + 1), (p), (n)) - 1)
+#define BLOCK_SIZE(id, p, n) (BLOCK_HIGH((id), (p), (n)) - BLOCK_LOW((id), (p), (n)) + 1)
+#define BLOCK_OWNER(index, p, n) (((p)*((index) + 1) - 1)/(n))
+
+extern void import_JPEG_file(const char *filename, unsigned char **image_chars,
+			     int *image_height, int *image_width,
+			     int *num_components);
+
+extern void export_JPEG_file(const char *filename, unsigned char *image_chars,
+			     int image_height, int image_width,
+			     int num_components, int quality);
+
+/* rank and size are global variables */
+static int my_rank, num_procs;
+
+typedef struct {
+  float** image_data;
+  int m;
+  int n;
+} image;
+
+void allocate_image (image *u, int m, int n) 
+{
+  int i;
+  float *A_storage = (float*)malloc(m*n*sizeof(float));
+  float **A = (float**)malloc(m*sizeof(float*));
+
+  if (A_storage == NULL || A == NULL) {
+    fprintf(stderr, "process %d: allocation failed.\n", my_rank);
+    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+  }
+
+  for (i = 0; i < m; i++)
+    A[i] = &(A_storage[i*n]);
+
+  u->image_data = A;
+  u->m = m;
+  u->n = n;
+}
+
+void deallocate_image (image *u)
+{
+  float **A = u->image_data;
+
+  free(A[0]);
+  free(A);
+}
+
+void copy_image(image * dest, const image * src) {
+  int i, j;
+  int m, n;
+
+  m = src->m;
+  n = src->n;
+
+  for (i = 0; i < m; i++)
+    for (j = 0; j < n; j++)
+      dest->image_data[i][j] = src->image_data[i][j];
+}
+
+void iso_diffusion_denoising(image *u, image *u_bar, 
+			     float kappa, int iters)
+{
+  int i, j, it;
+  int m = u->m;
+  int n = u->n;
+  int prev, next;
+
+  prev = my_rank > 0 ? my_rank - 1 : MPI_PROC_NULL;
+  next = my_rank < num_procs - 1 ? my_rank + 1 : MPI_PROC_NULL;
+
+  copy_image(u_bar, u);
+
+  for (it = 0; it < iters; it++) {
+    for (i = 1; i < m-1; i++)
+      for (j = 1; j < n-1; j++)
+	u_bar->image_data[i][j] = u->image_data[i][j] +
+	  kappa * (u->image_data[i-1][j] + u->image_data[i][j-1] -
+		   4 * u->image_data[i][j] +
+		   u->image_data[i][j+1] + u->image_data[i+1][j]);
+
+    MPI_Sendrecv(u_bar->image_data[1], n, MPI_FLOAT,
+		 prev, 101,
+		 u_bar->image_data[m-1], n, MPI_FLOAT,
+		 next, 101,
+		 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+    MPI_Sendrecv(u_bar->image_data[m-2], n, MPI_FLOAT,
+		 next, 102,
+		 u_bar->image_data[0], n, MPI_FLOAT,
+		 prev, 102,
+		 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+    copy_image(u, u_bar);
+  }
+}
+
+int main(int argc, char *argv[])
+{
+  int m, n, c, iters = 10, i, j;
+  int my_m;
+  float kappa = 0.1;
+  image u, u_bar;
+  int *counts, *displs;
+  unsigned char *image_chars;
+  unsigned char *my_image_chars;
+  char *input_jpeg_filename = "noisy-paprika.jpg";
+  char *output_jpeg_filename = "smoothed.jpeg";
+ 
+  MPI_Init (&argc, &argv);
+  MPI_Comm_rank (MPI_COMM_WORLD, &my_rank);
+  MPI_Comm_size (MPI_COMM_WORLD, &num_procs);
+
+  /* read from command line: kappa, iters, input_jpeg_filename, output_jpeg_filename */
+ 
+  if (argc > 1)
+    kappa = atof(argv[1]);
+  if (argc > 2)
+    iters = atoi(argv[2]);
+  if (argc > 3)
+    input_jpeg_filename = argv[3];
+  if (argc > 4)
+    output_jpeg_filename = argv[4];
+  
+  /* import jpeg file */
+  if (my_rank == 0)
+    import_JPEG_file(input_jpeg_filename, &image_chars, &m, &n, &c);
+
+  /* cast m and n to all processes */
+  MPI_Bcast (&m, 1, MPI_INT, 0, MPI_COMM_WORLD);
+  MPI_Bcast (&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+  /* allocate data for scatterv and gatherv */
+  counts = malloc(num_procs * sizeof(int));
+  displs = malloc(num_procs * sizeof(int));
+
+  if (counts == NULL || displs == NULL) {
+    fprintf(stderr, "process %d: malloc failed.\n", my_rank);
+    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+  }
+
+  /* divide the m x n pixels evenly among the MPI processes */
+  for (i = 0; i < num_procs; i++) {
+    counts[i] = (BLOCK_SIZE(i, num_procs, m-2) + 2) * n;
+    displs[i] = (BLOCK_LOW (i, num_procs, m-2)) * n;
+  }
+
+  my_m = counts[my_rank]/n;
+  
+  /* allocate local part of image */
+  my_image_chars = malloc(my_m * n * sizeof(unsigned char));
+
+  if (my_image_chars == NULL) {
+    fprintf(stderr, "process %d: malloc failed.\n", my_rank);
+    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+  }
+
+  /* scatter data to processes */
+  MPI_Scatterv(image_chars, counts, displs,
+	       MPI_UNSIGNED_CHAR,
+	       my_image_chars, my_m * n,
+	       MPI_UNSIGNED_CHAR,
+	       0, MPI_COMM_WORLD);
+
+  /* allocate u and u bar, with memory storage of my_m x my_n  */
+  allocate_image(&u,     my_m, n);
+  allocate_image(&u_bar, my_m, n);
+
+  /* change format to float */
+  for (i = 0; i < my_m; i++)
+    for (j = 0; j < n; j++)
+      u.image_data[i][j] =
+	(float) my_image_chars[i*n + j];
+
+  /* denoising */
+  iso_diffusion_denoising(&u, &u_bar, kappa, iters);
+
+  /* change format back to unsigned char */
+  for (i = 0; i < my_m; i++)
+    for (j = 0; j < n; j++)
+      my_image_chars[i*n + j] =
+	(unsigned char) u.image_data[i][j];
+
+  /* gather data from processes */
+  MPI_Gatherv(my_image_chars, my_m * n,
+	      MPI_UNSIGNED_CHAR,
+	      image_chars, counts, displs,
+	      MPI_UNSIGNED_CHAR,
+	      0, MPI_COMM_WORLD);
+
+  /* export denoised pixels to jpeg file */
+  if (my_rank == 0)
+    export_JPEG_file(output_jpeg_filename, image_chars, m, n, c, 75);
+
+  /* deallocate memory */
+
+  deallocate_image(&u_bar);
+  deallocate_image(&u);
+  free(my_image_chars);
+  free(displs);
+  free(counts);
+
+  MPI_Finalize ();
+  exit(EXIT_SUCCESS);
+}

@@ -1,0 +1,27 @@
+#include <stdlib.h>
+
+main() 
+{
+
+  
+  typedef struct 
+  {
+    float **data_image;
+    
+  }image;
+  
+  void allocate_image (image *u)
+  {
+    float *A_storage = (float*)malloc(2*2*sizeof(float));
+    float **A = (float**)malloc(2*sizeof(float*));
+    int i;
+    for (i = 0; i < 2; i++)
+      A[i] = &(A_storage[i*2]);
+    
+    (*u).data_image = A;
+  }
+
+  image u;
+  
+  allocate_image(&u);
+}

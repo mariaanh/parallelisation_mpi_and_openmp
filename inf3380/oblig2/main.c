@@ -1,0 +1,302 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <mpi.h>
+#include <omp.h>
+
+#define BLOCK_LOW(id, p, n) ((id)*(n)/(p))
+#define BLOCK_HIGH(id, p, n) (BLOCK_LOW(((id) + 1), (p), (n)) - 1)
+#define BLOCK_SIZE(id, p, n) (BLOCK_HIGH((id), (p), (n)) - BLOCK_LOW((id), (p), (n)) + 1)
+#define BLOCK_OWNER(index, p, n) (((p)*((index) + 1) - 1)/(n))
+
+static int my_rank, num_procs;
+
+typedef struct {
+  double** my_matrix;
+  int num_rows;
+  int num_cols;
+  int partition_id;
+} matrix;
+
+void read_matrix_binaryformat (char* filename, double*** matrix,
+			       int* num_rows, int* num_cols)
+{
+  int i;
+  FILE* fp = fopen (filename, "rb");
+  fread (num_rows, sizeof(int), 1, fp);
+  fread (num_cols, sizeof(int), 1, fp);
+
+  /* storage allocation of the matrix */
+  *matrix = (double**)malloc((*num_rows)*sizeof(double*));
+  (*matrix)[0] = (double*)malloc((*num_rows)*(*num_cols)*sizeof(double));
+
+  for (i = 1; i < (*num_rows); i++)
+    (*matrix)[i] = (*matrix)[i - 1] + (*num_cols);
+
+  /* read in the entire matrix */
+  fread ((*matrix)[0], sizeof(double), (*num_rows)*(*num_cols), fp);
+  fclose (fp);
+}
+
+void write_matrix_binaryformat (char* filename, double*** matrix, 
+				int num_rows, int num_cols)
+{
+  FILE *fp = fopen (filename, "wb");
+  fwrite (&num_rows, sizeof(int), 1, fp);
+  fwrite (&num_cols, sizeof(int), 1, fp);
+  fwrite ((*matrix)[0], sizeof(double), num_rows*num_cols, fp);
+  fclose (fp);
+}
+
+void allocate_matrix (double*** matrix, int num_rows, 
+		      int num_cols) 
+{
+  int i;
+  double* A_storage = (double*)malloc(num_rows * num_cols * sizeof(double));
+  double** A = (double**)malloc(num_rows * sizeof(double*));
+  
+  if (A_storage == NULL || A == NULL) {
+    fprintf(stderr, "process %d: allocation failed. \n", my_rank);
+    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+  }
+
+  for (i = 0; i < num_rows; i++)
+    A[i] = &(A_storage[i * num_cols]);
+
+  *matrix = A;
+}
+
+void deallocate_matrix (double*** matrix)
+{
+  free((*matrix)[0]);
+  free(*matrix);
+} 
+
+int max(int* num_rows_b)
+{
+  int i;
+  int max = 0;
+
+  for (i = 0; i < num_procs; i++) {
+    if (max < BLOCK_SIZE(i, num_procs, (*num_rows_b)))
+      max = BLOCK_SIZE(i, num_procs, (*num_rows_b));
+  }
+    
+  return max;
+}
+
+void set_my_c_zero(matrix* my_c) 
+{
+  int rows = my_c -> num_rows;
+  int cols = my_c -> num_cols;
+  int i, j;
+  
+  for (i = 0; i < rows; i++) {
+    for (j = 0; j < cols; j++) {
+      my_c -> my_matrix[i][j] = 0;
+    }
+  }
+}
+
+void multiply_elements(matrix* my_a, matrix* my_b, 
+		       matrix* my_c, int* original_num_rows_b)
+{
+  int rows_my_a = my_a -> num_rows;
+  int rows_my_b = my_b -> num_rows;
+  int cols_my_b = my_b -> num_cols;
+  int partition_id = my_b -> partition_id;
+  int start_index_a = BLOCK_LOW(partition_id, num_procs, (*original_num_rows_b));
+
+  int i, j, k;
+  
+  omp_set_num_threads(rows_my_a);
+
+  #pragma parallel for private(j,k)    
+  for (i = 0; i < rows_my_a; i++) {
+    for (j = start_index_a; j < start_index_a + rows_my_b; j++) {
+      for (k = 0; k < cols_my_b; k++) {
+	my_c -> my_matrix[i][k] = (my_c -> my_matrix[i][k]) + 
+	  ((my_a -> my_matrix[i][j]) * (my_b -> my_matrix[j - start_index_a][k]));
+      }
+    }
+  }
+}
+
+void exchange_partition_b(matrix* my_b, int* largest_partition,
+			  int* original_num_rows_b) 
+{
+  int prev, next;
+  int i, j;
+  double** my_b2;
+  int num_rows_b = my_b -> num_rows;
+  int num_cols_b = my_b -> num_cols;
+  int partition_id = my_b -> partition_id;
+
+  prev = my_rank > 0 ? my_rank - 1 : num_procs - 1;
+  next = my_rank < num_procs - 1 ? my_rank + 1 : 0; 
+  int recv_partition_id = partition_id > 0 ? partition_id - 1 : num_procs - 1;
+
+  int recv_rows = BLOCK_SIZE(recv_partition_id, num_procs, (*original_num_rows_b));
+
+  allocate_matrix(&my_b2, (*largest_partition), num_cols_b);
+
+  MPI_Sendrecv(my_b -> my_matrix[0], num_rows_b*num_cols_b, 
+	       MPI_DOUBLE, next, 0, my_b2[0], 
+	       recv_rows*num_cols_b, MPI_DOUBLE, 
+	       prev, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+  for (i = 0; i < my_b -> num_rows; i++) {
+    for (j = 0; j < my_b -> num_cols; j++) {
+      my_b -> my_matrix[i][j] = 0;
+    }
+  }
+
+  for (i = 0; i < recv_rows; i++) {
+    for (j = 0; j < num_cols_b; j++) {
+      my_b -> my_matrix[i][j] = my_b2[i][j];
+    }
+  } 
+      
+  my_b -> partition_id = prev;
+  my_b -> num_rows = recv_rows;
+
+  deallocate_matrix(&my_b2);
+}
+
+int main(int argc, char *argv[])
+{
+  char *file_b = "small_matrix_B.bin";
+  char *file_a = "small_matrix_A.bin";
+  char *file_c = "matrix_c.bin";
+  char *file_e = "matrix_e.bin";
+  char *file_d = "matrix_d.bin";
+
+  matrix my_a, my_b, my_c;
+
+  double** matrix_a;
+  double** matrix_b;
+  double** matrix_c;
+  double** matrix_d;
+  double** matrix_e;
+
+  int num_rows_a, num_rows_b, num_rows_c;
+  int num_cols_a, num_cols_b, num_cols_c;
+  int i, j;
+
+  MPI_Init (&argc, &argv);
+  MPI_Comm_rank (MPI_COMM_WORLD, &my_rank);
+  MPI_Comm_size (MPI_COMM_WORLD, &num_procs);
+
+  if (argc == 2) {
+    file_a = argv[0];
+    file_b = argv[1];
+  }
+
+  if (my_rank == 0) {
+    read_matrix_binaryformat(file_b, &matrix_b, &num_rows_b,
+			     &num_cols_b);
+    read_matrix_binaryformat(file_a, &matrix_a, &num_rows_a,
+			     &num_cols_a);
+  }
+  
+  MPI_Bcast(&num_rows_b, 1, MPI_INT, 0, MPI_COMM_WORLD);
+  MPI_Bcast(&num_cols_b, 1, MPI_INT, 0, MPI_COMM_WORLD);
+  MPI_Bcast(&num_rows_a, 1, MPI_INT, 0, MPI_COMM_WORLD);
+  MPI_Bcast(&num_cols_a, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+  int partition_size_a = BLOCK_SIZE(my_rank, num_procs, num_rows_a);
+  int partition_size_b = BLOCK_SIZE(my_rank, num_procs, num_rows_b);
+
+  int max_partition_b = max(&num_rows_b);
+  
+  /* allocate my_a and my_b */
+  allocate_matrix(&my_a.my_matrix, partition_size_a, num_cols_a);
+  allocate_matrix(&my_b.my_matrix, max_partition_b, num_cols_b);
+  
+  /* slicing details of b matrix*/
+  int* send_count = malloc(num_procs * sizeof(int));
+  int* displs = malloc(num_procs * sizeof(int));
+
+  for (i = 0; i < num_procs; i++) {
+    send_count[i] = BLOCK_SIZE(i, num_procs, num_rows_b)*num_cols_b;
+    displs[i] = BLOCK_LOW(i, num_procs, num_rows_b)*num_cols_b;
+  }
+  
+  /* scatter partitions of b */
+  MPI_Scatterv(my_rank > 0 ? NULL : matrix_b[0], send_count, displs,
+	       MPI_DOUBLE, my_b.my_matrix[0], send_count[my_rank], 
+	       MPI_DOUBLE, 0, MPI_COMM_WORLD); 
+
+  my_a.num_rows = partition_size_a;
+  my_a.num_cols = num_cols_a;
+  my_b.num_rows = partition_size_b;
+  my_b.num_cols = num_cols_b;
+  my_a.partition_id = my_rank;
+  my_b.partition_id = my_rank;
+
+  /* slicing details of a matrix */
+  for (i = 0; i < num_procs; i++) {
+    send_count[i] = BLOCK_SIZE(i, num_procs, num_rows_a)*num_cols_a;
+    displs[i] = BLOCK_LOW(i, num_procs, num_rows_a)*num_cols_a;
+  }
+
+  /* scatter partitions of a */
+  MPI_Scatterv(my_rank > 0 ? NULL : matrix_a[0], send_count, displs,
+	       MPI_DOUBLE, my_a.my_matrix[0], send_count[my_rank],
+	       MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+  /* allocate my_c */
+  allocate_matrix(&my_c.my_matrix, partition_size_a, num_cols_b);
+  my_c.num_rows = partition_size_a;
+  my_c.num_cols = num_cols_b;
+
+  /* set my_c zero */
+  set_my_c_zero(&my_c);
+
+  /* calculate my_c */
+  for (i = 0; i < num_procs - 1; i++) {
+    multiply_elements(&my_a, &my_b, &my_c, &num_rows_b);
+    exchange_partition_b(&my_b, &max_partition_b, &num_rows_b);
+  }
+  
+  multiply_elements(&my_a, &my_b, &my_c, &num_rows_b);
+  
+
+  /* allocate matrix_c */
+  if (my_rank == 0) {
+    allocate_matrix(&matrix_c, num_rows_a, num_cols_b); 
+  }
+
+  /* details of slices of c */
+  for (i = 0; i < num_procs; i++) {
+    send_count[i] = BLOCK_SIZE(i, num_procs, num_rows_a)*num_cols_b;
+    displs[i] = BLOCK_LOW(i, num_procs, num_rows_a)*num_cols_b;
+  }
+
+  /* gather my_c from each processor */
+  MPI_Gatherv(my_c.my_matrix[0], my_c.num_rows*my_c.num_cols, 
+	      MPI_DOUBLE, my_rank > 0 ? NULL : matrix_c[0],
+	      send_count, displs, 
+	      MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+  /* write resulting matrix_c to file */
+  if (my_rank == 0) {
+    write_matrix_binaryformat(file_c, &matrix_c, num_rows_a,
+			      num_cols_b);
+  }
+
+  /* deallocate matrix */
+  if (my_rank == 0) {
+    deallocate_matrix(&matrix_a);
+    deallocate_matrix(&matrix_b);
+    deallocate_matrix(&matrix_c);
+  }
+
+  deallocate_matrix(&my_c.my_matrix);
+  deallocate_matrix(&my_a.my_matrix);
+  deallocate_matrix(&my_b.my_matrix);
+  free(displs);
+  free(send_count);
+  
+  MPI_Finalize ();
+  exit(EXIT_SUCCESS);
+}
