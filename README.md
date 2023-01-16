@@ -1,2 +1,2 @@
-# parallelisation_mpi_and_openmp
+# parallelisation with openmp and mpi
 Applying parallelisation with openmp and mpi to smooth an image
